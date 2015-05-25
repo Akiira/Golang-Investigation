@@ -1,0 +1,61 @@
+//*********************
+//** HW#4 Problem 1  **
+//**   ShareNum.go   **
+//*********************
+
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"runtime"
+	"strconv"
+	"sync"
+	"time"
+)
+
+/* Global Variables  */
+var wg sync.WaitGroup
+var Num int
+
+func IncrementNum() {
+	for i := 1; i <= 3; i++ {
+		Num = func(v1 int) int {
+			return v1
+		}(Num) + i
+	}
+
+	wg.Done()
+}
+
+func DecrementNum() {
+	for i := 1; i <= 3; i++ {
+		Num = Num - i
+	}
+
+	wg.Done()
+}
+
+func main() {
+	Init()
+
+	Num = 10
+
+	go IncrementNum()
+	go DecrementNum()
+
+	wg.Wait()
+
+	fmt.Println("The final value of Num is: ", Num)
+}
+
+//Do not edit
+func Init() {
+	runtime.GOMAXPROCS(2)
+	wg.Add(2)
+}
+
+func RandomSleep() {
+	d, _ := time.ParseDuration(strconv.Itoa(rand.Intn(1000)))
+	time.Sleep(d * time.Millisecond)
+}
