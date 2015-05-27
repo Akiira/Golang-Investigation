@@ -1,0 +1,1185 @@
+// Copyright 2013 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package main
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"io"
+	"io/ioutil"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+const usageMessage = "" +
+	`Usage of 'go tool cover':
+Given a coverage profile produced by 'go test':
+	go test -coverprofile=c.out
+
+Open a web browser displaying annotated source code:
+	go tool cover -html=c.out
+
+Write out an HTML file instead of launching a web browser:
+	go tool cover -html=c.out -o coverage.html
+
+Display coverage percentages to stdout for each function:
+	go tool cover -func=c.out
+
+Finally, to generate modified source code with coverage annotations
+(what go test -cover does):
+	go tool cover -mode=set -var=CoverageVariableName program.go
+`
+
+func usage() {
+	GoCover.Count[0]++
+	fmt.Fprintln(os.Stderr, usageMessage)
+	fmt.Fprintln(os.Stderr, "Flags:")
+	flag.PrintDefaults()
+	fmt.Fprintln(os.Stderr, "\n  Only one of -html, -func, or -mode may be set.")
+	os.Exit(2)
+}
+
+var (
+	mode	= flag.String("mode", "", "coverage mode: set, count, atomic")
+	varVar	= flag.String("var", "GoCover", "name of coverage variable to generate")
+	output	= flag.String("o", "", "file for output; default: stdout")
+	htmlOut	= flag.String("html", "", "generate HTML representation of coverage profile")
+	funcOut	= flag.String("func", "", "output coverage profile information for each function")
+)
+
+var profile string	// The profile to read; the value of -html or -func
+
+var counterStmt func(*File, ast.Expr) ast.Stmt
+
+const (
+	atomicPackagePath	= "sync/atomic"
+	atomicPackageName	= "_cover_atomic_"
+)
+
+func main() {
+	GoCover.Count[1]++
+	flag.Usage = usage
+	flag.Parse()
+	fmt.Println("arg 0: ", os.Args[0])
+	fmt.Println("arg 1: ", os.Args[1])
+
+	counterStmt = setCounterStmt
+	annotate(os.Args[1])
+
+}
+
+// parseFlags sets the profile and counterStmt globals and performs validations.
+func parseFlags() error {
+	GoCover.Count[2]++
+	profile = *htmlOut
+	if *funcOut != "" {
+		GoCover.Count[6]++
+		if profile != "" {
+			GoCover.Count[8]++
+			return fmt.Errorf("too many options")
+		}
+		GoCover.Count[7]++
+		profile = *funcOut
+	}
+	GoCover.Count[3]++
+
+	if (profile == "") == (*mode == "") {
+		GoCover.Count[9]++
+		return fmt.Errorf("too many options")
+	}
+	GoCover.Count[4]++
+
+	if *mode != "" {
+		GoCover.Count[10]++
+		switch *mode {
+		case "set":
+			GoCover.Count[12]++
+			counterStmt = setCounterStmt
+		case "count":
+			GoCover.Count[13]++
+			counterStmt = incCounterStmt
+		case "atomic":
+			GoCover.Count[14]++
+			counterStmt = atomicCounterStmt
+		default:
+			GoCover.Count[15]++
+			return fmt.Errorf("unknown -mode %v", *mode)
+		}
+		GoCover.Count[11]++
+
+		if flag.NArg() == 0 {
+			GoCover.Count[16]++
+			return fmt.Errorf("missing source file")
+		} else {
+			GoCover.Count[17]++
+			if flag.NArg() == 1 {
+				GoCover.Count[18]++
+				return nil
+			}
+		}
+	} else {
+		GoCover.Count[19]++
+		if flag.NArg() == 0 {
+			GoCover.Count[20]++
+			return nil
+		}
+	}
+	GoCover.Count[5]++
+	return fmt.Errorf("too many arguments")
+}
+
+// Block represents the information about a basic block to be recorded in the analysis.
+// Note: Our definition of basic block is based on control structures; we don't break
+// apart && and ||. We could but it doesn't seem important enough to bother.
+type Block struct {
+	startByte	token.Pos
+	endByte		token.Pos
+	numStmt		int
+}
+
+// File is a wrapper for the state of a file used in the parser.
+// The basic parse tree walker is a method of this type.
+type File struct {
+	fset		*token.FileSet
+	name		string	// Name of file.
+	astFile		*ast.File
+	blocks		[]Block
+	atomicPkg	string	// Package name for "sync/atomic" in this file.
+}
+
+// Visit implements the ast.Visitor interface.
+func (f *File) Visit(node ast.Node) ast.Visitor {
+	GoCover.Count[21]++
+	switch n := node.(type) {
+	case *ast.BlockStmt:
+		GoCover.Count[23]++
+
+		if len(n.List) > 0 {
+			GoCover.Count[31]++
+			switch n.List[0].(type) {
+			case *ast.CaseClause:
+				GoCover.Count[32]++
+				for _, n := range n.List {
+					GoCover.Count[36]++
+					clause := n.(*ast.CaseClause)
+					clause.Body = f.addCounters(clause.Pos(), clause.End(), clause.Body, false)
+				}
+				GoCover.Count[33]++
+				return f
+			case *ast.CommClause:
+				GoCover.Count[34]++
+				for _, n := range n.List {
+					GoCover.Count[37]++
+					clause := n.(*ast.CommClause)
+					clause.Body = f.addCounters(clause.Pos(), clause.End(), clause.Body, false)
+				}
+				GoCover.Count[35]++
+				return f
+			}
+		}
+		GoCover.Count[24]++
+		n.List = f.addCounters(n.Lbrace, n.Rbrace+1, n.List, true)
+	case *ast.IfStmt:
+		GoCover.Count[25]++
+		ast.Walk(f, n.Body)
+		if n.Else == nil {
+			GoCover.Count[38]++
+			return nil
+		}
+		GoCover.Count[26]++
+
+		switch stmt := n.Else.(type) {
+		case *ast.IfStmt:
+			GoCover.Count[39]++
+			block := &ast.BlockStmt{
+				Lbrace:	n.Body.End(),
+				List:	[]ast.Stmt{stmt},
+				Rbrace:	stmt.End(),
+			}
+			n.Else = block
+		case *ast.BlockStmt:
+			GoCover.Count[40]++
+			stmt.Lbrace = n.Body.End()
+		default:
+			GoCover.Count[41]++
+			panic("unexpected node type in if")
+		}
+		GoCover.Count[27]++
+		ast.Walk(f, n.Else)
+		return nil
+	case *ast.SelectStmt:
+		GoCover.Count[28]++
+
+		if n.Body == nil || len(n.Body.List) == 0 {
+			GoCover.Count[42]++
+			return nil
+		}
+	case *ast.SwitchStmt:
+		GoCover.Count[29]++
+
+		if n.Body == nil || len(n.Body.List) == 0 {
+			GoCover.Count[43]++
+			return nil
+		}
+	case *ast.TypeSwitchStmt:
+		GoCover.Count[30]++
+
+		if n.Body == nil || len(n.Body.List) == 0 {
+			GoCover.Count[44]++
+			return nil
+		}
+	}
+	GoCover.Count[22]++
+	return f
+}
+
+// unquote returns the unquoted string.
+func unquote(s string) string {
+	GoCover.Count[45]++
+	t, err := strconv.Unquote(s)
+	if err != nil {
+		GoCover.Count[47]++
+		log.Fatalf("cover: improperly quoted string %q\n", s)
+	}
+	GoCover.Count[46]++
+	return t
+}
+
+// addImport adds an import for the specified path, if one does not already exist, and returns
+// the local package name.
+func (f *File) addImport(path string) string {
+	GoCover.Count[48]++
+
+	for _, s := range f.astFile.Imports {
+		GoCover.Count[50]++
+		if unquote(s.Path.Value) == path {
+			GoCover.Count[51]++
+			if s.Name != nil {
+				GoCover.Count[53]++
+				return s.Name.Name
+			}
+			GoCover.Count[52]++
+			return filepath.Base(path)
+		}
+	}
+	GoCover.Count[49]++
+	newImport := &ast.ImportSpec{
+		Name:	ast.NewIdent(atomicPackageName),
+		Path: &ast.BasicLit{
+			Kind:	token.STRING,
+			Value:	fmt.Sprintf("%q", path),
+		},
+	}
+	impDecl := &ast.GenDecl{
+		Tok:	token.IMPORT,
+		Specs: []ast.Spec{
+			newImport,
+		},
+	}
+
+	astFile := f.astFile
+	astFile.Decls = append(astFile.Decls, nil)
+	copy(astFile.Decls[1:], astFile.Decls[0:])
+	astFile.Decls[0] = impDecl
+	astFile.Imports = append(astFile.Imports, newImport)
+
+	reference := &ast.GenDecl{
+		Tok:	token.VAR,
+		Specs: []ast.Spec{
+			&ast.ValueSpec{
+				Names: []*ast.Ident{
+					ast.NewIdent("_"),
+				},
+				Values: []ast.Expr{
+					&ast.SelectorExpr{
+						X:	ast.NewIdent(atomicPackageName),
+						Sel:	ast.NewIdent("AddUint32"),
+					},
+				},
+			},
+		},
+	}
+	astFile.Decls = append(astFile.Decls, reference)
+	return atomicPackageName
+}
+
+var slashslash = []byte("//")
+
+// initialComments returns the prefix of content containing only
+// whitespace and line comments.  Any +build directives must appear
+// within this region.  This approach is more reliable than using
+// go/printer to print a modified AST containing comments.
+//
+func initialComments(content []byte) []byte {
+	GoCover.Count[54]++
+
+	end := 0
+	p := content
+	for len(p) > 0 {
+		GoCover.Count[56]++
+		line := p
+		if i := bytes.IndexByte(line, '\n'); i >= 0 {
+			GoCover.Count[59]++
+			line, p = line[:i], p[i+1:]
+		} else {
+			GoCover.Count[60]++
+			p = p[len(p):]
+		}
+		GoCover.Count[57]++
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			GoCover.Count[61]++
+			end = len(content) - len(p)
+			continue
+		}
+		GoCover.Count[58]++
+		if !bytes.HasPrefix(line, slashslash) {
+			GoCover.Count[62]++
+			break
+		}
+	}
+	GoCover.Count[55]++
+	return content[:end]
+}
+
+func annotate(fileName string) {
+	GoCover.Count[63]++
+	fset := token.NewFileSet()
+
+	content, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		GoCover.Count[68]++
+		log.Fatalf("cover: %s: %s", fileName, err)
+	}
+	GoCover.Count[64]++
+
+	parsedFile, err := parser.ParseFile(fset, fileName, content, parser.ParseComments)
+	if err != nil {
+		GoCover.Count[69]++
+		log.Fatalf("cover: %s: %s", fileName, err)
+	}
+	GoCover.Count[65]++
+	parsedFile.Comments = trimComments(parsedFile, fset)
+
+	file := &File{
+		fset:		fset,
+		name:		fileName,
+		astFile:	parsedFile,
+	}
+	if *mode == "atomic" {
+		GoCover.Count[70]++
+		file.atomicPkg = file.addImport(atomicPackagePath)
+	}
+	GoCover.Count[66]++
+	ast.Walk(file, file.astFile)
+	fd := os.Stdout
+	if *output != "" {
+		GoCover.Count[71]++
+		var err error
+		fd, err = os.Create(*output)
+		if err != nil {
+			GoCover.Count[72]++
+			log.Fatalf("cover: %s", err)
+		}
+	}
+	GoCover.Count[67]++
+	fd.Write(initialComments(content))
+	file.print(fd)
+
+	file.addVariables(fd)
+}
+
+// trimComments drops all but the //go: comments, some of which are semantically important.
+// We drop all others because they can appear in places that cause our counters
+// to appear in syntactically incorrect places. //go: appears at the beginning of
+// the line and is syntactically safe.
+func trimComments(file *ast.File, fset *token.FileSet) []*ast.CommentGroup {
+	GoCover.Count[73]++
+	var comments []*ast.CommentGroup
+	for _, group := range file.Comments {
+		GoCover.Count[75]++
+		var list []*ast.Comment
+		for _, comment := range group.List {
+			GoCover.Count[77]++
+			if strings.HasPrefix(comment.Text, "//go:") && fset.Position(comment.Slash).Column == 1 {
+				GoCover.Count[78]++
+				list = append(list, comment)
+			}
+		}
+		GoCover.Count[76]++
+		if list != nil {
+			GoCover.Count[79]++
+			comments = append(comments, &ast.CommentGroup{list})
+		}
+	}
+	GoCover.Count[74]++
+	return comments
+}
+
+func (f *File) print(w io.Writer) {
+	GoCover.Count[80]++
+	printer.Fprint(w, f.fset, f.astFile)
+}
+
+// intLiteral returns an ast.BasicLit representing the integer value.
+func (f *File) intLiteral(i int) *ast.BasicLit {
+	GoCover.Count[81]++
+	node := &ast.BasicLit{
+		Kind:	token.INT,
+		Value:	fmt.Sprint(i),
+	}
+	return node
+}
+
+// index returns an ast.BasicLit representing the number of counters present.
+func (f *File) index() *ast.BasicLit {
+	GoCover.Count[82]++
+	return f.intLiteral(len(f.blocks))
+}
+
+// setCounterStmt returns the expression: __count[23] = 1.
+func setCounterStmt(f *File, counter ast.Expr) ast.Stmt {
+	GoCover.Count[83]++
+	return &ast.AssignStmt{
+		Lhs:	[]ast.Expr{counter},
+		Tok:	token.ASSIGN,
+		Rhs:	[]ast.Expr{f.intLiteral(1)},
+	}
+}
+
+// incCounterStmt returns the expression: __count[23]++.
+func incCounterStmt(f *File, counter ast.Expr) ast.Stmt {
+	GoCover.Count[84]++
+	return &ast.IncDecStmt{
+		X:	counter,
+		Tok:	token.INC,
+	}
+}
+
+// atomicCounterStmt returns the expression: atomic.AddUint32(&__count[23], 1)
+func atomicCounterStmt(f *File, counter ast.Expr) ast.Stmt {
+	GoCover.Count[85]++
+	return &ast.ExprStmt{
+		X: &ast.CallExpr{
+			Fun: &ast.SelectorExpr{
+				X:	ast.NewIdent(f.atomicPkg),
+				Sel:	ast.NewIdent("AddUint32"),
+			},
+			Args: []ast.Expr{&ast.UnaryExpr{
+				Op:	token.AND,
+				X:	counter,
+			},
+				f.intLiteral(1),
+			},
+		},
+	}
+}
+
+// newCounter creates a new counter expression of the appropriate form.
+func (f *File) newCounter(start, end token.Pos, numStmt int) ast.Stmt {
+	GoCover.Count[86]++
+	counter := &ast.IndexExpr{
+		X: &ast.SelectorExpr{
+			X:	ast.NewIdent(*varVar),
+			Sel:	ast.NewIdent("Count"),
+		},
+		Index:	f.index(),
+	}
+	stmt := counterStmt(f, counter)
+	f.blocks = append(f.blocks, Block{start, end, numStmt})
+	return stmt
+}
+
+// addCounters takes a list of statements and adds counters to the beginning of
+// each basic block at the top level of that list. For instance, given
+//
+//	S1
+//	if cond {
+//		S2
+// 	}
+//	S3
+//
+// counters will be added before S1 and before S3. The block containing S2
+// will be visited in a separate call.
+// TODO: Nested simple blocks get unnecessary (but correct) counters
+func (f *File) addCounters(pos, blockEnd token.Pos, list []ast.Stmt, extendToClosingBrace bool) []ast.Stmt {
+	GoCover.Count[87]++
+
+	if len(list) == 0 {
+		GoCover.Count[90]++
+		return []ast.Stmt{f.newCounter(pos, blockEnd, 0)}
+	}
+	GoCover.Count[88]++
+	// We have a block (statement list), but it may have several basic blocks due to the
+	// appearance of statements that affect the flow of control.
+	var newList []ast.Stmt
+	for {
+		GoCover.Count[91]++
+		// Find first statement that affects flow of control (break, continue, if, etc.).
+		// It will be the last statement of this basic block.
+		var last int
+		end := blockEnd
+		for last = 0; last < len(list); last++ {
+			GoCover.Count[96]++
+			end = f.statementBoundary(list[last])
+			if f.endsBasicSourceBlock(list[last]) {
+				GoCover.Count[97]++
+				extendToClosingBrace = false
+				last++
+				break
+			}
+		}
+		GoCover.Count[92]++
+		if extendToClosingBrace {
+			GoCover.Count[98]++
+			end = blockEnd
+		}
+		GoCover.Count[93]++
+		if pos != end {
+			GoCover.Count[99]++
+			newList = append(newList, f.newCounter(pos, end, last))
+		}
+		GoCover.Count[94]++
+		newList = append(newList, list[0:last]...)
+		list = list[last:]
+		if len(list) == 0 {
+			GoCover.Count[100]++
+			break
+		}
+		GoCover.Count[95]++
+		pos = list[0].Pos()
+	}
+	GoCover.Count[89]++
+	return newList
+}
+
+// hasFuncLiteral reports the existence and position of the first func literal
+// in the node, if any. If a func literal appears, it usually marks the termination
+// of a basic block because the function body is itself a block.
+// Therefore we draw a line at the start of the body of the first function literal we find.
+// TODO: what if there's more than one? Probably doesn't matter much.
+func hasFuncLiteral(n ast.Node) (bool, token.Pos) {
+	GoCover.Count[101]++
+	if n == nil {
+		GoCover.Count[103]++
+		return false, 0
+	}
+	GoCover.Count[102]++
+	var literal funcLitFinder
+	ast.Walk(&literal, n)
+	return literal.found(), token.Pos(literal)
+}
+
+// statementBoundary finds the location in s that terminates the current basic
+// block in the source.
+func (f *File) statementBoundary(s ast.Stmt) token.Pos {
+	GoCover.Count[104]++
+
+	switch s := s.(type) {
+	case *ast.BlockStmt:
+		GoCover.Count[107]++
+
+		return s.Lbrace
+	case *ast.IfStmt:
+		GoCover.Count[108]++
+		found, pos := hasFuncLiteral(s.Init)
+		if found {
+			GoCover.Count[124]++
+			return pos
+		}
+		GoCover.Count[109]++
+		found, pos = hasFuncLiteral(s.Cond)
+		if found {
+			GoCover.Count[125]++
+			return pos
+		}
+		GoCover.Count[110]++
+		return s.Body.Lbrace
+	case *ast.ForStmt:
+		GoCover.Count[111]++
+		found, pos := hasFuncLiteral(s.Init)
+		if found {
+			GoCover.Count[126]++
+			return pos
+		}
+		GoCover.Count[112]++
+		found, pos = hasFuncLiteral(s.Cond)
+		if found {
+			GoCover.Count[127]++
+			return pos
+		}
+		GoCover.Count[113]++
+		found, pos = hasFuncLiteral(s.Post)
+		if found {
+			GoCover.Count[128]++
+			return pos
+		}
+		GoCover.Count[114]++
+		return s.Body.Lbrace
+	case *ast.LabeledStmt:
+		GoCover.Count[115]++
+		return f.statementBoundary(s.Stmt)
+	case *ast.RangeStmt:
+		GoCover.Count[116]++
+		found, pos := hasFuncLiteral(s.X)
+		if found {
+			GoCover.Count[129]++
+			return pos
+		}
+		GoCover.Count[117]++
+		return s.Body.Lbrace
+	case *ast.SwitchStmt:
+		GoCover.Count[118]++
+		found, pos := hasFuncLiteral(s.Init)
+		if found {
+			GoCover.Count[130]++
+			return pos
+		}
+		GoCover.Count[119]++
+		found, pos = hasFuncLiteral(s.Tag)
+		if found {
+			GoCover.Count[131]++
+			return pos
+		}
+		GoCover.Count[120]++
+		return s.Body.Lbrace
+	case *ast.SelectStmt:
+		GoCover.Count[121]++
+		return s.Body.Lbrace
+	case *ast.TypeSwitchStmt:
+		GoCover.Count[122]++
+		found, pos := hasFuncLiteral(s.Init)
+		if found {
+			GoCover.Count[132]++
+			return pos
+		}
+		GoCover.Count[123]++
+		return s.Body.Lbrace
+	}
+	GoCover.Count[105]++
+
+	found, pos := hasFuncLiteral(s)
+	if found {
+		GoCover.Count[133]++
+		return pos
+	}
+	GoCover.Count[106]++
+	return s.End()
+}
+
+// endsBasicSourceBlock reports whether s changes the flow of control: break, if, etc.,
+// or if it's just problematic, for instance contains a function literal, which will complicate
+// accounting due to the block-within-an expression.
+func (f *File) endsBasicSourceBlock(s ast.Stmt) bool {
+	GoCover.Count[134]++
+	switch s := s.(type) {
+	case *ast.BlockStmt:
+		GoCover.Count[136]++
+
+		return true
+	case *ast.BranchStmt:
+		GoCover.Count[137]++
+		return true
+	case *ast.ForStmt:
+		GoCover.Count[138]++
+		return true
+	case *ast.IfStmt:
+		GoCover.Count[139]++
+		return true
+	case *ast.LabeledStmt:
+		GoCover.Count[140]++
+		return f.endsBasicSourceBlock(s.Stmt)
+	case *ast.RangeStmt:
+		GoCover.Count[141]++
+		return true
+	case *ast.SwitchStmt:
+		GoCover.Count[142]++
+		return true
+	case *ast.SelectStmt:
+		GoCover.Count[143]++
+		return true
+	case *ast.TypeSwitchStmt:
+		GoCover.Count[144]++
+		return true
+	case *ast.ExprStmt:
+		GoCover.Count[145]++
+
+		if call, ok := s.X.(*ast.CallExpr); ok {
+			GoCover.Count[146]++
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "panic" && len(call.Args) == 1 {
+				GoCover.Count[147]++
+				return true
+			}
+		}
+	}
+	GoCover.Count[135]++
+	found, _ := hasFuncLiteral(s)
+	return found
+}
+
+// funcLitFinder implements the ast.Visitor pattern to find the location of any
+// function literal in a subtree.
+type funcLitFinder token.Pos
+
+func (f *funcLitFinder) Visit(node ast.Node) (w ast.Visitor) {
+	GoCover.Count[148]++
+	if f.found() {
+		GoCover.Count[151]++
+		return nil
+	}
+	GoCover.Count[149]++
+	switch n := node.(type) {
+	case *ast.FuncLit:
+		GoCover.Count[152]++
+		*f = funcLitFinder(n.Body.Lbrace)
+		return nil
+	}
+	GoCover.Count[150]++
+	return f
+}
+
+func (f *funcLitFinder) found() bool {
+	GoCover.Count[153]++
+	return token.Pos(*f) != token.NoPos
+}
+
+type block1 struct {
+	Block
+	index	int
+}
+
+type blockSlice []block1
+
+func (b blockSlice) Len() int		{ GoCover.Count[154]++; return len(b) }
+func (b blockSlice) Less(i, j int) bool	{ GoCover.Count[155]++; return b[i].startByte < b[j].startByte }
+func (b blockSlice) Swap(i, j int)	{ GoCover.Count[156]++; b[i], b[j] = b[j], b[i] }
+
+// offset translates a token position into a 0-indexed byte offset.
+func (f *File) offset(pos token.Pos) int {
+	GoCover.Count[157]++
+	return f.fset.Position(pos).Offset
+}
+
+// addVariables adds to the end of the file the declarations to set up the counter and position variables.
+func (f *File) addVariables(w io.Writer) {
+	GoCover.Count[158]++
+
+	t := make([]block1, len(f.blocks))
+	for i := range f.blocks {
+		GoCover.Count[163]++
+		t[i].Block = f.blocks[i]
+		t[i].index = i
+	}
+	GoCover.Count[159]++
+	sort.Sort(blockSlice(t))
+	for i := 1; i < len(t); i++ {
+		GoCover.Count[164]++
+		if t[i-1].endByte > t[i].startByte {
+			GoCover.Count[165]++
+			fmt.Fprintf(os.Stderr, "cover: internal error: block %d overlaps block %d\n", t[i-1].index, t[i].index)
+
+			fmt.Fprintf(os.Stderr, "\t%s:#%d,#%d %s:#%d,#%d\n",
+				f.name, f.offset(t[i-1].startByte), f.offset(t[i-1].endByte),
+				f.name, f.offset(t[i].startByte), f.offset(t[i].endByte))
+		}
+	}
+	GoCover.Count[160]++
+
+	fmt.Fprintf(w, "\nvar %s = struct {\n", *varVar)
+	fmt.Fprintf(w, "\tCount     [%d]uint32\n", len(f.blocks))
+	fmt.Fprintf(w, "\tPos       [3 * %d]uint32\n", len(f.blocks))
+	fmt.Fprintf(w, "\tNumStmt   [%d]uint16\n", len(f.blocks))
+	fmt.Fprintf(w, "} {\n")
+
+	fmt.Fprintf(w, "\tPos: [3 * %d]uint32{\n", len(f.blocks))
+
+	for i, block := range f.blocks {
+		GoCover.Count[166]++
+		start := f.fset.Position(block.startByte)
+		end := f.fset.Position(block.endByte)
+		fmt.Fprintf(w, "\t\t%d, %d, %#x, // [%d]\n", start.Line, end.Line, (end.Column&0xFFFF)<<16|(start.Column&0xFFFF), i)
+	}
+	GoCover.Count[161]++
+
+	fmt.Fprintf(w, "\t},\n")
+
+	fmt.Fprintf(w, "\tNumStmt: [%d]uint16{\n", len(f.blocks))
+
+	for i, block := range f.blocks {
+		GoCover.Count[167]++
+		n := block.numStmt
+		if n > 1<<16-1 {
+			GoCover.Count[169]++
+			n = 1<<16 - 1
+		}
+		GoCover.Count[168]++
+		fmt.Fprintf(w, "\t\t%d, // %d\n", n, i)
+	}
+	GoCover.Count[162]++
+
+	fmt.Fprintf(w, "\t},\n")
+
+	fmt.Fprintf(w, "}\n")
+}
+
+var GoCover = struct {
+	Count     [170]uint32
+	Pos       [3 * 170]uint32
+	NumStmt   [170]uint16
+} {
+	Pos: [3 * 170]uint32{
+		44, 50, 0x2000e, // [0]
+		69, 98, 0x2000d, // [1]
+		101, 103, 0x140019, // [2]
+		111, 111, 0x260002, // [3]
+		115, 115, 0x110002, // [4]
+		135, 135, 0x290002, // [5]
+		103, 104, 0x140014, // [6]
+		107, 107, 0x150003, // [7]
+		104, 106, 0x40014, // [8]
+		111, 113, 0x30026, // [9]
+		115, 116, 0x100011, // [10]
+		127, 127, 0x170003, // [11]
+		117, 118, 0x200003, // [12]
+		119, 120, 0x200003, // [13]
+		121, 122, 0x230003, // [14]
+		123, 124, 0x300003, // [15]
+		127, 129, 0x40017, // [16]
+		129, 129, 0x1e0004, // [17]
+		129, 131, 0x4001e, // [18]
+		132, 132, 0x1d0003, // [19]
+		132, 134, 0x3001d, // [20]
+		158, 159, 0x1a0031, // [21]
+		226, 226, 0xa0002, // [22]
+		160, 162, 0x160002, // [23]
+		178, 178, 0x3d0003, // [24]
+		179, 181, 0x140002, // [25]
+		195, 195, 0x200003, // [26]
+		208, 209, 0xd0003, // [27]
+		210, 212, 0x2d0002, // [28]
+		215, 217, 0x2d0002, // [29]
+		220, 222, 0x2d0002, // [30]
+		162, 163, 0x1c0016, // [31]
+		164, 165, 0x1e0004, // [32]
+		169, 169, 0xd0005, // [33]
+		170, 171, 0x1e0004, // [34]
+		175, 175, 0xd0005, // [35]
+		165, 168, 0x6001e, // [36]
+		171, 174, 0x6001e, // [37]
+		181, 183, 0x40014, // [38]
+		196, 202, 0x120003, // [39]
+		203, 204, 0x1e0003, // [40]
+		205, 206, 0x270003, // [41]
+		212, 214, 0x4002d, // [42]
+		217, 219, 0x4002d, // [43]
+		222, 224, 0x4002d, // [44]
+		230, 232, 0x10001f, // [45]
+		235, 235, 0xa0002, // [46]
+		232, 234, 0x30010, // [47]
+		240, 242, 0x26002e, // [48]
+		250, 290, 0x1a0002, // [49]
+		242, 243, 0x240026, // [50]
+		243, 244, 0x150024, // [51]
+		247, 247, 0x1e0004, // [52]
+		244, 246, 0x50015, // [53]
+		300, 304, 0x11002d, // [54]
+		320, 320, 0x160002, // [55]
+		304, 306, 0x2f0011, // [56]
+		311, 312, 0x150003, // [57]
+		316, 316, 0x290003, // [58]
+		306, 308, 0x4002f, // [59]
+		308, 310, 0x40004, // [60]
+		312, 314, 0xc0015, // [61]
+		316, 317, 0x90029, // [62]
+		323, 327, 0x100020, // [63]
+		331, 332, 0x100002, // [64]
+		335, 342, 0x170002, // [65]
+		345, 347, 0x130002, // [66]
+		354, 358, 0x170002, // [67]
+		327, 329, 0x30010, // [68]
+		332, 334, 0x30010, // [69]
+		342, 344, 0x30017, // [70]
+		347, 350, 0x110013, // [71]
+		350, 352, 0x40011, // [72]
+		365, 367, 0x26004c, // [73]
+		378, 378, 0x110002, // [74]
+		367, 369, 0x260026, // [75]
+		374, 374, 0x120003, // [76]
+		369, 370, 0x5c0026, // [77]
+		370, 372, 0x5005c, // [78]
+		374, 376, 0x40012, // [79]
+		381, 383, 0x20023, // [80]
+		386, 392, 0x20030, // [81]
+		395, 397, 0x20026, // [82]
+		400, 406, 0x20039, // [83]
+		409, 414, 0x20039, // [84]
+		417, 432, 0x2003c, // [85]
+		435, 446, 0x20047, // [86]
+		460, 463, 0x14006c, // [87]
+		468, 469, 0x60002, // [88]
+		495, 495, 0x100002, // [89]
+		463, 465, 0x30014, // [90]
+		469, 474, 0x2a0006, // [91]
+		482, 482, 0x1b0003, // [92]
+		485, 485, 0x110003, // [93]
+		488, 490, 0x150003, // [94]
+		493, 493, 0x160003, // [95]
+		474, 476, 0x2a002a, // [96]
+		476, 479, 0xa002a, // [97]
+		482, 484, 0x4001b, // [98]
+		485, 487, 0x40011, // [99]
+		490, 491, 0x90015, // [100]
+		503, 504, 0xe0033, // [101]
+		507, 509, 0x2c0002, // [102]
+		504, 506, 0x3000e, // [103]
+		514, 516, 0x170038, // [104]
+		575, 576, 0xb0002, // [105]
+		579, 579, 0x100002, // [106]
+		517, 519, 0x120002, // [107]
+		520, 522, 0xc0002, // [108]
+		525, 526, 0xc0003, // [109]
+		529, 529, 0x170003, // [110]
+		530, 532, 0xc0002, // [111]
+		535, 536, 0xc0003, // [112]
+		539, 540, 0xc0003, // [113]
+		543, 543, 0x170003, // [114]
+		544, 545, 0x250002, // [115]
+		546, 548, 0xc0002, // [116]
+		551, 551, 0x170003, // [117]
+		552, 554, 0xc0002, // [118]
+		557, 558, 0xc0003, // [119]
+		561, 561, 0x170003, // [120]
+		562, 563, 0x170002, // [121]
+		564, 566, 0xc0002, // [122]
+		569, 569, 0x170003, // [123]
+		522, 524, 0x4000c, // [124]
+		526, 528, 0x4000c, // [125]
+		532, 534, 0x4000c, // [126]
+		536, 538, 0x4000c, // [127]
+		540, 542, 0x4000c, // [128]
+		548, 550, 0x4000c, // [129]
+		554, 556, 0x4000c, // [130]
+		558, 560, 0x4000c, // [131]
+		566, 568, 0x4000c, // [132]
+		576, 578, 0x3000b, // [133]
+		585, 586, 0x170036, // [134]
+		617, 618, 0xe0002, // [135]
+		587, 589, 0xe0002, // [136]
+		590, 591, 0xe0002, // [137]
+		592, 593, 0xe0002, // [138]
+		594, 595, 0xe0002, // [139]
+		596, 597, 0x280002, // [140]
+		598, 599, 0xe0002, // [141]
+		600, 601, 0xe0002, // [142]
+		602, 603, 0xe0002, // [143]
+		604, 605, 0xe0002, // [144]
+		606, 611, 0x2a0002, // [145]
+		611, 612, 0x5e002a, // [146]
+		612, 614, 0x5005e, // [147]
+		625, 626, 0xf003e, // [148]
+		629, 629, 0x1a0002, // [149]
+		634, 634, 0xa0002, // [150]
+		626, 628, 0x3000f, // [151]
+		630, 632, 0xd0002, // [152]
+		637, 639, 0x20026, // [153]
+		650, 650, 0x3a0029, // [154]
+		651, 651, 0x530029, // [155]
+		652, 652, 0x440029, // [156]
+		655, 657, 0x2002a, // [157]
+		660, 663, 0x1a002a, // [158]
+		667, 668, 0x1e0002, // [159]
+		679, 692, 0x210002, // [160]
+		699, 707, 0x210002, // [161]
+		716, 719, 0x170002, // [162]
+		663, 666, 0x3001a, // [163]
+		668, 669, 0x26001e, // [164]
+		669, 675, 0x40026, // [165]
+		692, 696, 0x30021, // [166]
+		707, 709, 0x120021, // [167]
+		712, 712, 0x2a0003, // [168]
+		709, 711, 0x40012, // [169]
+	},
+	NumStmt: [170]uint16{
+		5, // 0
+		6, // 1
+		2, // 2
+		1, // 3
+		1, // 4
+		1, // 5
+		1, // 6
+		1, // 7
+		1, // 8
+		1, // 9
+		1, // 10
+		1, // 11
+		1, // 12
+		1, // 13
+		1, // 14
+		1, // 15
+		1, // 16
+		1, // 17
+		1, // 18
+		1, // 19
+		1, // 20
+		1, // 21
+		1, // 22
+		1, // 23
+		1, // 24
+		2, // 25
+		1, // 26
+		2, // 27
+		1, // 28
+		1, // 29
+		1, // 30
+		1, // 31
+		1, // 32
+		1, // 33
+		1, // 34
+		1, // 35
+		2, // 36
+		2, // 37
+		1, // 38
+		2, // 39
+		1, // 40
+		1, // 41
+		1, // 42
+		1, // 43
+		1, // 44
+		2, // 45
+		1, // 46
+		1, // 47
+		1, // 48
+		10, // 49
+		1, // 50
+		1, // 51
+		1, // 52
+		1, // 53
+		3, // 54
+		1, // 55
+		2, // 56
+		2, // 57
+		1, // 58
+		1, // 59
+		1, // 60
+		2, // 61
+		1, // 62
+		3, // 63
+		2, // 64
+		3, // 65
+		3, // 66
+		3, // 67
+		1, // 68
+		1, // 69
+		1, // 70
+		3, // 71
+		1, // 72
+		2, // 73
+		1, // 74
+		2, // 75
+		1, // 76
+		1, // 77
+		1, // 78
+		1, // 79
+		1, // 80
+		2, // 81
+		1, // 82
+		1, // 83
+		1, // 84
+		1, // 85
+		4, // 86
+		1, // 87
+		2, // 88
+		1, // 89
+		1, // 90
+		3, // 91
+		1, // 92
+		1, // 93
+		3, // 94
+		1, // 95
+		2, // 96
+		3, // 97
+		1, // 98
+		1, // 99
+		1, // 100
+		1, // 101
+		3, // 102
+		1, // 103
+		1, // 104
+		2, // 105
+		1, // 106
+		1, // 107
+		2, // 108
+		2, // 109
+		1, // 110
+		2, // 111
+		2, // 112
+		2, // 113
+		1, // 114
+		1, // 115
+		2, // 116
+		1, // 117
+		2, // 118
+		2, // 119
+		1, // 120
+		1, // 121
+		2, // 122
+		1, // 123
+		1, // 124
+		1, // 125
+		1, // 126
+		1, // 127
+		1, // 128
+		1, // 129
+		1, // 130
+		1, // 131
+		1, // 132
+		1, // 133
+		1, // 134
+		2, // 135
+		1, // 136
+		1, // 137
+		1, // 138
+		1, // 139
+		1, // 140
+		1, // 141
+		1, // 142
+		1, // 143
+		1, // 144
+		1, // 145
+		1, // 146
+		1, // 147
+		1, // 148
+		1, // 149
+		1, // 150
+		1, // 151
+		2, // 152
+		1, // 153
+		1, // 154
+		1, // 155
+		1, // 156
+		1, // 157
+		2, // 158
+		2, // 159
+		7, // 160
+		3, // 161
+		2, // 162
+		2, // 163
+		1, // 164
+		2, // 165
+		3, // 166
+		2, // 167
+		1, // 168
+		1, // 169
+	},
+}
